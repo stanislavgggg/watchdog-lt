@@ -55,6 +55,7 @@ CREATE TABLE IF NOT EXISTS leads (
     event TEXT NOT NULL DEFAULT 'lead',
     phone TEXT, q1 TEXT, q2 TEXT, q3 TEXT, score TEXT,
     zoneid TEXT, campaignid TEXT, subid TEXT,
+    quiz TEXT DEFAULT 'laliga',
     is_duplicate INTEGER DEFAULT 0,
     forwarded INTEGER DEFAULT 0,
     raw TEXT
@@ -73,6 +74,11 @@ def db() -> sqlite3.Connection:
         _local.db = sqlite3.connect(DB_PATH)
         _local.db.row_factory = sqlite3.Row
         _local.db.executescript(SCHEMA)
+        try:  # миграция старой базы без колонки quiz
+            _local.db.execute("ALTER TABLE leads ADD COLUMN quiz TEXT DEFAULT 'laliga'")
+            _local.db.commit()
+        except sqlite3.OperationalError:
+            pass
     return _local.db
 
 
@@ -117,7 +123,7 @@ def lead():
 
     cur = con.execute(
         "INSERT INTO leads (ts,email,email_hash,event,phone,q1,q2,q3,score,"
-        "zoneid,campaignid,subid,is_duplicate,raw) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        "zoneid,campaignid,subid,quiz,is_duplicate,raw) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
         (datetime.now(timezone.utc).isoformat(timespec="seconds"),
          email, h, event,
          clean(data.get("phone"), 20),
@@ -126,6 +132,7 @@ def lead():
          clean(data.get("zoneid") or data.get("zone"), 20),
          clean(data.get("campaignid"), 20),
          clean(data.get("subid"), 64),
+         clean(data.get("quiz"), 20) or "laliga",
          dup,
          json.dumps(data, ensure_ascii=False)[:2000]))
     con.commit()
@@ -163,32 +170,55 @@ def health():
 
 # ---------------- фоновый форвардер ----------------
 
-def mc_url(h: str) -> str:
-    return f"https://{MC_DC}.api.mailchimp.com/3.0/lists/{MC_LIST}/members/{h}"
+def mc_list_for(quiz: str) -> str:
+    # отдельная аудитория на квиз: MAILCHIMP_LIST_ID_KREPSINIS и т.п.; иначе общая
+    return os.environ.get(f"MAILCHIMP_LIST_ID_{(quiz or 'laliga').upper()}", MC_LIST)
+
+
+def mc_url(h: str, list_id: str = "") -> str:
+    return f"https://{MC_DC}.api.mailchimp.com/3.0/lists/{list_id or MC_LIST}/members/{h}"
+
+
+def _mc(method: str, url: str, auth, payload: dict) -> requests.Response:
+    r = requests.request(method, url, auth=auth, timeout=20, json=payload)
+    if r.status_code >= 400:
+        log.error("Mailchimp %s %s -> %d: %s", method, url.split("/3.0/")[-1],
+                  r.status_code, r.text[:300])
+    return r
 
 
 def forward_row(row: sqlite3.Row, con: sqlite3.Connection):
     auth = ("x", MC_KEY)
     h = row["email_hash"]
+    quiz = (row["quiz"] if "quiz" in row.keys() else "") or "laliga"
+    lst = mc_list_for(quiz)
 
-    if MC_KEY and MC_LIST:
+    if MC_KEY and lst:
         if row["event"] == "phone":
-            requests.patch(mc_url(h), auth=auth, timeout=20, json={
+            _mc("PATCH", mc_url(h, lst), auth, {
                 "merge_fields": {"PHONE": row["phone"] or ""}})
-            requests.post(mc_url(h) + "/tags", auth=auth, timeout=20, json={
+            _mc("POST", mc_url(h, lst) + "/tags", auth, {
                 "tags": [{"name": "sms-optin", "status": "active"}]})
         else:
-            requests.put(mc_url(h), auth=auth, timeout=20, json={
+            body = {
                 "email_address": row["email"],
                 "status_if_new": "subscribed", "status": "subscribed",
                 "merge_fields": {"ZONE": row["zoneid"] or "",
                                  "CAMP": row["campaignid"] or "",
-                                 "SUBID": row["subid"] or ""}})
-            tags = ["quiz-laliga",
-                    f"team-{row['q1'] or 'na'}", f"freq-{row['q2'] or 'na'}",
-                    f"bookie-{row['q3'] or 'na'}", f"score-{row['score'] or 'warm'}"]
-            requests.post(mc_url(h) + "/tags", auth=auth, timeout=20, json={
-                "tags": [{"name": t, "status": "active"} for t in tags]})
+                                 "SUBID": row["subid"] or ""},
+            }
+            r = _mc("PUT", mc_url(h, lst), auth, body)
+            if r.status_code == 400:
+                # Скорее всего merge fields не созданы в аудитории —
+                # повторяем без них, контакт важнее полей.
+                body.pop("merge_fields")
+                r = _mc("PUT", mc_url(h, lst), auth, body)
+            if r.status_code < 400:
+                tags = [f"quiz-{quiz}",
+                        f"team-{row['q1'] or 'na'}", f"freq-{row['q2'] or 'na'}",
+                        f"bookie-{row['q3'] or 'na'}", f"score-{row['score'] or 'warm'}"]
+                _mc("POST", mc_url(h, lst) + "/tags", auth, {
+                    "tags": [{"name": t, "status": "active"} for t in tags]})
 
     if SLACK_URL:
         if row["event"] == "phone":
